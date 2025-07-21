@@ -17,28 +17,39 @@
 #include <poppler-page.h>
 #include <cstdio>
 
+#include <assert.h>
+
 namespace fs = std::filesystem;
 
-// Result structure
-struct SearchResult	{
-	fs::path pdf_path;
-	int	page;
-	int	line_number;
-	std::string	line;
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+struct Occurence {
+	int page;
+	int line_number;
+	std::string line;
 };
 
-// Get all PDF files in	directory (optionally shuffled)
-std::vector<fs::path> get_pdf_files(const fs::path&	directory, bool	shuffle) {
+struct SearchResult {
+	fs::path pdf_path;
+	std::vector<Occurence> occurences;
+	bool completed = false;
+	bool printed = false; // True when the final 2-line output for this result has been printed and finalized.
+};
+
+// Get all PDF files in directory (optionally shuffled)
+std::vector<fs::path> get_pdf_files(const fs::path& directory, bool shuffle) {
 	std::vector<fs::path> pdf_files;
-	for	(const auto& entry : fs::recursive_directory_iterator(directory)) {
-		if (entry.is_regular_file()	&& entry.path().extension()	== ".pdf") {
+	for (const auto& entry : fs::recursive_directory_iterator(directory)) {
+		if (entry.is_regular_file() && entry.path().extension() == ".pdf") {
 			pdf_files.push_back(entry.path());
 		}
 	}
 	if (shuffle) {
 		std::random_device rd;
 		std::mt19937 g(rd());
-		std::shuffle(pdf_files.begin(),	pdf_files.end(), g);
+		std::shuffle(pdf_files.begin(), pdf_files.end(), g);
 	}
 	return pdf_files;
 }
@@ -47,216 +58,317 @@ void suppress_poppler_stderr() {
 #ifdef _WIN32
 	freopen("NUL", "w", stderr);
 #else
-	freopen("/dev/null", "w", stderr); // On Windows: "NUL"
+	freopen("/dev/null", "w", stderr);
 #endif
 }
 
 #ifdef _WIN32
-#include <windows.h>
 void enable_ansi_escape_codes() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE) return;
-    DWORD dwMode = 0;
-    if (!GetConsoleMode(hOut, &dwMode)) return;
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, dwMode);
+	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (hOut == INVALID_HANDLE_VALUE) return;
+	DWORD dwMode = 0;
+	if (!GetConsoleMode(hOut, &dwMode)) return;
+	dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+	SetConsoleMode(hOut, dwMode);
 }
 #else
 void enable_ansi_escape_codes() {}
 #endif
 
+// User's provided delete_last_lines function - DO NOT CHANGE
+void delete_last_lines(int count) {
+	for (int i = 0; i < count; ++i) // Loop count-1 times to move up and clear
+		std::cout << "\033[1A" // Move cursor up
+				  << "\033[2K\r";  // Clear entire line and return cursor to beginning
+	std::cout.flush();
+}
 
-int	main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) {
 	suppress_poppler_stderr();
 	enable_ansi_escape_codes();
-	// --- Settings	---
+
+	// --- Settings ---
 	bool shuffle = false;
 	bool sort_result = false;
 	bool print_line = false;
 	bool print_path = false;
-	std::string	directory;
-	std::string	target;
+	std::string directory;
+	std::string target;
 
 	// --- Parse command line ---
-	for	(int i = 1;	i <	argc; ++i) {
-		std::string	arg(argv[i]);
-		if (arg	== "--shuffle")	shuffle	= true;
-		else if	(arg ==	"--sort") sort_result =	true;
-		else if	(arg ==	"--printline") print_line=	true;
-		else if	(arg ==	"--printpath") print_path=	true;
-		else if	(directory.empty())	directory =	arg;
-		else if	(target.empty()) target	= arg;
+	for (int i = 1; i < argc; ++i) {
+		std::string arg(argv[i]);
+		if (arg == "--shuffle") shuffle = true;
+		else if (arg == "--sort") sort_result = true;
+		else if (arg == "--printline") print_line = true;
+		else if (arg == "--printpath") print_path = true;
+		else if (directory.empty()) directory = arg;
+		else if (target.empty()) target = arg;
 	}
 
-	if (target.empty())	{
-		if (!directory.empty())	{
+	if (target.empty()) {
+		if (!directory.empty()) {
 			std::swap(directory, target);
 		} else {
-			std::cerr << "Usage: " << argv[0] << " [<directory>] <search-string> [--shuffle] [--sort] [--printline] [--printpath]\n";
+			std::cout << "Usage: " << argv[0] << " [<directory>] <search-string> [--shuffle] [--sort] [--printline] [--printpath]\n";
 			return 1;
 		}
 	}
 
-	fs::path dir = directory.empty() ? fs::current_path() :	fs::path(directory);
-
-	// Prepare file	list
-	std::vector<fs::path> pdfs = get_pdf_files(dir,	shuffle);
-	std::atomic<size_t>	file_index{0};
-	std::atomic<bool> aborted{false};
+	fs::path dir = directory.empty() ? fs::current_path() : fs::path(directory);
+	std::vector<fs::path> pdfs = get_pdf_files(dir, shuffle);
 	size_t total_files = pdfs.size();
 
-	// Thread-safe result queue
-	std::queue<SearchResult> result_queue;
-	std::mutex queue_mutex;
-	std::condition_variable	queue_cv;
+	std::vector<std::shared_ptr<SearchResult>> results;
+	std::mutex results_mutex; // Mutex to protect 'results' vector modifications
 
-	std::atomic<size_t>	completed_files{0};
-	std::atomic<bool> all_done{false};
+	std::condition_variable queue_cv; // Condition variable to signal updates to main thread
+
+	std::atomic<size_t> file_index{ 0 }; // Atomic counter for files to be processed by workers
+	std::atomic<size_t> completed_files{ 0 }; // Atomic counter for completed files
+	std::atomic<bool> aborted{ false }; // Flag to signal threads to stop
 
 	// --- Abort input thread ---
-	std::thread	abort_thread([&aborted]() {
-		std::string	line;
-		while (std::getline(std::cin, line)) {
-			if (line ==	"q"	|| line	== "Q")	{
-				aborted	= true;
-				break;
-			}
-		}
+	std::thread abort_thread([&aborted]() {
+		std::string line;
+		std::getline(std::cin, line);
+		aborted = true;
 	});
 
-	// --- Worker thread function ---
-	auto worker	= [&]()	{
+	auto worker_func = [&]() {
 		while (!aborted) {
 			size_t idx = file_index.fetch_add(1);
-			if (idx	>= total_files)	break;
+			if (idx >= total_files) {
+				//std::cout << "No more files to process\n";
+				break; // No more files to process
+			}
 
-			const auto&	pdf_path = pdfs[idx];
-			auto doc = poppler::document::load_from_file(pdf_path.string());
+			const auto& pdf_path = pdfs[idx];
+			std::string pdf_path_str = pdf_path.string();
+
+			poppler::document* doc = nullptr;
+			try {
+				doc = poppler::document::load_from_file(pdf_path_str);
+			} catch (...) {
+				doc = nullptr;
+			}
+
 			if (!doc) {
-				std::cerr << "Failed to	open: "	<< pdf_path	<< "\n";
 				completed_files++;
 				continue;
 			}
+			std::shared_ptr<SearchResult> current_res = std::make_shared<SearchResult>();
+			current_res->pdf_path = pdf_path;
+			{
+				std::unique_lock<std::mutex> lock(results_mutex);
+				results.push_back(current_res);
+			}
 
-			int	pages =	doc->pages();
-			for	(int i = 0;	i <	pages && !aborted; ++i)	{
-				std::unique_ptr<poppler::page> page(doc->create_page(i));
-				if (!page)
-					continue;
-
-				auto utf8 =	page->text().to_utf8();
-				std::string	page_text(utf8.data(), utf8.size());
-
+			int pages = doc->pages();
+			for (int i = 0; i < pages && !aborted; ++i) {
+				auto page = std::unique_ptr<poppler::page>(doc->create_page(i));
+				if (!page) continue;
+				auto utf8 = page->text().to_utf8();
+				std::string page_text(utf8.data(), utf8.size());
 				std::istringstream iss(page_text);
-				std::string	line;
-				int	line_number	= 0;
-
-				while (std::getline(iss, line))	{
+				std::string line;
+				int line_number = 0;
+				while (std::getline(iss, line)) {
 					++line_number;
-					if (line.find(target) != std::string::npos)	{
-						SearchResult result{ pdf_path, i + 1, line_number, line	};
-						{
-							std::lock_guard<std::mutex>	lock(queue_mutex);
-							result_queue.push(result);
-						}
+					if (line.find(target) != std::string::npos) {
+						Occurence occurrence{ i + 1, line_number, line };
+						// Add occurrence directly to shared SearchResult
+						current_res->occurences.push_back(occurrence);
+						// Notify the main thread that there's an update.
+						// This notification is what allows the main thread to pick up incremental page findings.
 						queue_cv.notify_one();
 					}
 				}
 			}
-			completed_files++;
-			queue_cv.notify_one(); // in case main thread is waiting
+
+			// After processing all pages for this PDF
+			{
+				current_res->completed = true;
+				completed_files++;
+				queue_cv.notify_one(); // Notify main thread that this file is fully completed
+			}
+
+			delete doc; // Clean up Poppler document
 		}
 	};
 
 	// --- Launch worker threads ---
-	size_t num_threads = std::max<size_t>(1, std::thread::hardware_concurrency() - 2);
+	size_t num_threads = std::max<size_t>(1, std::thread::hardware_concurrency() - 1);
 	std::vector<std::thread> pool;
-	for	(size_t	i =	0; i < num_threads;	++i) {
-		pool.emplace_back(worker);
+	for (size_t i = 0; i < num_threads; ++i) {
+		pool.emplace_back(worker_func);
 	}
 
-	// --- Main	results	printing + progress	loop ---
-	std::vector<SearchResult> all_results;
+	// --- Main Display Logic (Block Update) ---
+	size_t idx_startUnprinted = 0; // Tracks the first file that is not yet finalized.
+	size_t lastPrintedResultCount = 0; // How many *results* (each 2 lines) were displayed in the *previous* refresh.
 
-	while (!aborted	&& (completed_files	< total_files || !result_queue.empty())) {
-		std::unique_lock<std::mutex> lock(queue_mutex);
-		queue_cv.wait_for(lock,	std::chrono::milliseconds(200),	[&]() {
-			size_t done = completed_files.load();
-			float progress = static_cast<float>(done) / total_files * 100.0f;
-			static int last_percent = -1;
-			int current_percent = static_cast<int>(progress);
-			if (current_percent != last_percent) {
-				last_percent = current_percent;
-				std::cout << std::setw(5)
-						  << std::fixed << std::setprecision(1)
-						  << progress << "%" << std::flush;
-				std::cout << std::flush << "\033[6D";
-			}
-			return !result_queue.empty() ||	aborted;
+	auto allPrinted = [&]() -> bool {
+		for (int i=0;i<results.size();++i) {
+			auto r = results[i].get();
+			if (r && !r->printed)
+				return false;
+		}
+		return true;
+	};
+
+	std::mutex printMutex;
+	bool progress_printed = false;
+	int completed_last_iter = 0;
+	while (!aborted && (completed_files < total_files || !allPrinted())) {
+		// Wait for a short period or until notified that new results are available.
+		std::unique_lock<std::mutex> printLock(printMutex);
+		queue_cv.wait_for(printLock, std::chrono::milliseconds(200), [&]() {
+			//float progress = float(completed_files)*100./total_files;
+			//std::cout << std::setw(5)
+			//		  << std::fixed << std::setprecision(1)
+			//		  << progress << "%\n" << std::flush;
+			//delete_last_lines(1);
+			return true;
 		});
 
-		bool was_results_queue_empty = result_queue.empty();
-		while (!result_queue.empty()) {
-			// remove percentage
-			SearchResult res = result_queue.front();
-			result_queue.pop();
-			all_results.push_back(res);
+		if (progress_printed)
+			delete_last_lines(1); // print progress
+		//assert(lastPrintedResultCount >= completed_last_iter);
+		delete_last_lines((lastPrintedResultCount-completed_last_iter) * 2);
 
-			static fs::path previousFile;
+		//if (lastPrintedResultCount > 0 && completed_last_iter > 0 && lastPrintedResultCount == completed_last_iter)
+		//	std::cout << "break\n";
+		//std::cout << "would deleting " << lastPrintedResultCount << " - " << completed_last_iter << " x2 lines\n";
+		completed_last_iter = 0;
+		size_t printedResultCount = 0; // Reset count for results printed in this cycle
 
-			if (!sort_result) {
-				static int prev_page= -1;
-				if (previousFile != res.pdf_path) {
-					// Progress	display
-					std::cout << "\n" << res.pdf_path.filename();
-					if (print_path)
-						std::cout << " " << res.pdf_path.parent_path();
-					prev_page = -1;
-					std::cout << ": Page ";
-				}
+		std::stringstream buf;
+		bool startIncompleteSet = false;
+		for (size_t i = idx_startUnprinted; i < results.size(); ++i) {
 
-				if (res.page != prev_page) {
-					std::cout << res.page << ", ";
-				
-					//TODO(skade) make option to print line number
-					//		  << ",	Line " << res.line_number;
-					//if (print_line) //TODO(skade) reimplement
-					//	std::cout << ":	" << res.line << "\n";
-					//else
-					//	std::cout << "\n";
-				}
-				prev_page = res.page;
+			std::shared_ptr<SearchResult> res;
+			bool completed;
+			{
+				std::unique_lock<std::mutex> lock(results_mutex);
+				res = results[i];
+				completed = res->completed;
 			}
-			previousFile = res.pdf_path;
+
+			if (completed && res->occurences.size()==0) {
+					res->printed = true;
+					continue;
+				}
+			else if (!completed && res->occurences.size()==0) {
+				continue;
+			}
+
+			std::vector<int> display_pages;
+			for (const auto& occ : res->occurences)
+				display_pages.push_back(occ.page);
+			std::sort(display_pages.begin(), display_pages.end());
+			display_pages.erase(std::unique(display_pages.begin(), display_pages.end()), display_pages.end());
+
+			{ // printing
+				// Line 1: Filename and optional path
+				buf << res->pdf_path.filename();
+				if (print_path) {
+					buf << "\t" << res->pdf_path.parent_path();
+				}
+				buf << "\n"; // Newline for the first line
+
+				// Line 2: Tab followed by pages
+				buf << "\t";
+				for (size_t j = 0; j < display_pages.size(); ++j) {
+					if (j > 0) buf << ", ";
+					buf << display_pages[j];
+				}
+				buf << "\n"; // Newline for the second line
+				printedResultCount++;
+			}
+
+			if (completed && !startIncompleteSet) {
+				res->printed = true;
+			}
+			else if (!startIncompleteSet) {
+				startIncompleteSet = true;
+			}
 		}
+		lastPrintedResultCount = printedResultCount;
+
+		while (idx_startUnprinted < results.size() && results[idx_startUnprinted]->printed) {
+			if (results[idx_startUnprinted]->occurences.size() > 0)
+				completed_last_iter++;
+			idx_startUnprinted++;
+		}
+
+		float progress = float(completed_files)*100./total_files;
+		buf << std::setw(5)
+				  << std::fixed << std::setprecision(1)
+				  << progress << "%\n" << std::flush;
+
+		std::cout << buf.str();
+		progress_printed = true;
 	}
 
-	// --- Cleanup ---
-	aborted	= true;
-	for	(auto& t : pool) t.join();
-	if (abort_thread.joinable()) abort_thread.detach();
+	//// --- Cleanup ---
+	aborted = true;
+	queue_cv.notify_all(); // Wake up all workers to see the aborted flag
+	for (auto& t : pool) t.join(); // Wait for all worker threads to finish
+	if (abort_thread.joinable()) abort_thread.detach(); // Detach the input thread
 
-	// --- Print final sorted results if enabled ---
+	const bool debug_check = true;
 	if (sort_result) {
-		std::sort(all_results.begin(), all_results.end(), [](const SearchResult& a,	const SearchResult&	b) {
-			if (a.pdf_path != b.pdf_path) return a.pdf_path	< b.pdf_path;
-			if (a.page != b.page) return a.page	< b.page;
-			return a.line_number < b.line_number;
-		});
 
-		if (all_results.empty()) {
-			std::cout << "No PDF files containing \"" << target	<< "\" found in	" << dir <<	"\n";
+		//delete_last_lines(results.size() * 2); // Clear the remaining active lines
+		// Create a copy to sort, so original `results` order (by processing start time) is preserved if needed.
+		std::vector<std::shared_ptr<SearchResult>> resultsSorted = results;
+		//std::sort(
+		//	resultsSorted.begin(), 
+		//	resultsSorted.end(), 
+		//	[](const std::shared_ptr<SearchResult>& a, const std::shared_ptr<SearchResult>& b) {
+		//		return a->pdf_path < b->pdf_path;
+		//	}
+		//);
+
+		if (resultsSorted.empty()) {
+			std::cout << "No PDF files containing \"" << target << "\" found in " << dir << "\n";
 		} else {
-			std::cout << "\nFinal matching results:\n";
-			for	(const auto& res : all_results)	{
-				std::cout << res.pdf_path << ":	Page " << res.page
-						  << ",	Line " << res.line_number
-						  << ":	" << res.line << "\n";
+			std::cout << "\nFinal matching results (sorted):\n";
+			for (auto res : resultsSorted) {
+				// Only print if there were any occurrences found
+				if (!res->occurences.empty()) {
+					// Line 1: Filename and optional path
+					std::cout << res->pdf_path.filename();
+					if (print_path)
+						std::cout << "\t" << res->pdf_path.parent_path();
+					std::cout << "\n";
+
+					// Line 2: Tab followed by pages (ensuring sorted and unique)
+					std::cout << "\t";
+					std::vector<int> final_pages_for_output;
+					for(const auto& occ : res->occurences) {
+						final_pages_for_output.push_back(occ.page);
+					}
+					std::sort(final_pages_for_output.begin(), final_pages_for_output.end());
+					final_pages_for_output.erase(std::unique(final_pages_for_output.begin(), final_pages_for_output.end()), final_pages_for_output.end());
+
+					for (size_t i = 0; i < final_pages_for_output.size(); ++i) {
+						if (i > 0) std::cout << ", ";
+						std::cout << final_pages_for_output[i];
+					}
+					std::cout << "\n";
+
+					// If print_line is requested, show full line details (these are separate, not part of the 2-line result)
+					if (print_line) {
+						for (const auto& occ : res->occurences) {
+							std::cout << "\t\tPage " << occ.page << ", Line " << occ.line_number << ": " << occ.line << "\n";
+						}
+					}
+				}
 			}
 		}
 	}
 
-	//TODO(skade) aborted is used for logic it means something different here
-	//std::cout << (aborted ?	"**	Search aborted by user **\n" : "** Search complete **\n");
 	return 0;
 }
