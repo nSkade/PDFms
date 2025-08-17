@@ -1,7 +1,6 @@
 # PDFms
-PDF multi search, crossplatform alternative to pdfgrep
+PDF multi search (in milliseconds), a fast simplified cross-platform alternative to pdfgrep
 
-- CLI
-- easy to use
-- multithreaded by default
-- in order multithreaded printing
+- easy to use CLI tool
+- multi-threaded by default
+- real time in order multi-threaded printing
