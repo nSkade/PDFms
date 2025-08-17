@@ -2,7 +2,6 @@
   "name": "pdfms",
   "version": "0.1.0",
   "dependencies": [
-    "poppler",
-    "ftxui"
+    "poppler"
   ]
 }

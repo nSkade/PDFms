@@ -16,8 +16,16 @@
 #include <poppler-document.h>
 #include <poppler-page.h>
 #include <cstdio>
+#include <cctype>
 
 #include <assert.h>
+
+// ftxui might be useful in the future but for now I have all printing features i want
+// addback "ftxui" in vcpkg.json
+//#include <ftxui/dom/elements.hpp>
+//#include <ftxui/screen/screen.hpp>
+//#include <ftxui/component/component.hpp>
+//#include <ftxui/component/screen_interactive.hpp>
 
 namespace fs = std::filesystem;
 
@@ -36,6 +44,7 @@ struct SearchResult {
 	std::vector<Occurence> occurences;
 	bool completed = false;
 	bool printed = false; // True when the final 2-line output for this result has been printed and finalized.
+	int printingHeight = 0;
 };
 
 // Get all PDF files in directory (optionally shuffled)
@@ -79,13 +88,58 @@ void enable_ansi_escape_codes() {}
 void delete_last_lines(int count) {
 	for (int i = 0; i < count; ++i) // Loop count-1 times to move up and clear
 		std::cout << "\033[1A" // Move cursor up
+#if 0 // clear line
 				  << "\033[2K\r";  // Clear entire line and return cursor to beginning
+#else // overwrite line, no flicker
+				  << "\r";  // Clear entire line and return cursor to beginning
+#endif
 	std::cout.flush();
+}
+
+std::string tolower(const std::string& s) {
+	std::string ret = s;
+	std::transform(ret.begin(),ret.end(),ret.begin(),[](unsigned char c) {return std::tolower(c);});
+	return ret;
+}
+
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__linux__) || defined(__APPLE__)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
+int getConsoleWidth() {
+    int columns = 80; // Default or fallback value
+
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+    }
+#elif defined(__linux__) || defined(__APPLE__)
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
+        columns = w.ws_col;
+    }
+#endif
+    return columns;
 }
 
 int main(int argc, char* argv[]) {
 	suppress_poppler_stderr();
 	enable_ansi_escape_codes();
+
+	//auto screen = ftxui::ScreenInteractive::TerminalOutput();
+	//auto renderer = ftxui::Renderer([&] {
+	//	return ftxui::vbox({
+	//		ftxui::text("Hello, FTXUI!"),
+	//		ftxui::separator(),
+	//		ftxui::text("Welcome to the terminal UI world."),
+	//	});
+	//});
+	//screen.Loop(renderer);
+	//return 0;
 
 	// --- Settings ---
 	bool shuffle = false;
@@ -135,6 +189,8 @@ int main(int argc, char* argv[]) {
 		aborted = true;
 	});
 
+	std::string targetLower = tolower(target);
+
 	auto worker_func = [&]() {
 		while (!aborted) {
 			size_t idx = file_index.fetch_add(1);
@@ -175,7 +231,7 @@ int main(int argc, char* argv[]) {
 				int line_number = 0;
 				while (std::getline(iss, line)) {
 					++line_number;
-					if (line.find(target) != std::string::npos) {
+					if (tolower(line).find(targetLower) != std::string::npos) {
 						Occurence occurrence{ i + 1, line_number, line };
 						// Add occurrence directly to shared SearchResult
 						current_res->occurences.push_back(occurrence);
@@ -235,7 +291,7 @@ int main(int argc, char* argv[]) {
 		if (progress_printed)
 			delete_last_lines(1); // print progress
 		//assert(lastPrintedResultCount >= completed_last_iter);
-		delete_last_lines((lastPrintedResultCount-completed_last_iter) * 2);
+		delete_last_lines((lastPrintedResultCount-completed_last_iter));
 
 		//if (lastPrintedResultCount > 0 && completed_last_iter > 0 && lastPrintedResultCount == completed_last_iter)
 		//	std::cout << "break\n";
@@ -270,21 +326,33 @@ int main(int argc, char* argv[]) {
 			display_pages.erase(std::unique(display_pages.begin(), display_pages.end()), display_pages.end());
 
 			{ // printing
-				// Line 1: Filename and optional path
-				buf << res->pdf_path.filename();
+				res->printingHeight = 0;
+				int consoleWidth = getConsoleWidth();
+				
+				// --- Line 1: Filename and optional path ---
+				std::string line1_content = res->pdf_path.filename().string();
 				if (print_path) {
-					buf << "\t" << res->pdf_path.parent_path();
+					line1_content += "    " + res->pdf_path.parent_path().string();
 				}
-				buf << "\n"; // Newline for the first line
-
-				// Line 2: Tab followed by pages
-				buf << "\t";
+				
+				int wrapped_lines_1 = (line1_content.length() + consoleWidth - 1) / consoleWidth;
+				
+				buf << line1_content << "\n";
+				printedResultCount += wrapped_lines_1;
+				res->printingHeight += wrapped_lines_1;
+				
+				// --- Line 2: Tab followed by pages ---
+				std::string line2_content = "    "; // Start with the tab
 				for (size_t j = 0; j < display_pages.size(); ++j) {
-					if (j > 0) buf << ", ";
-					buf << display_pages[j];
+					if (j > 0) line2_content += ", ";
+					line2_content += std::to_string(display_pages[j]);
 				}
-				buf << "\n"; // Newline for the second line
-				printedResultCount++;
+				
+				int wrapped_lines_2 = (line2_content.length() + consoleWidth - 1) / consoleWidth;
+				
+				buf << line2_content << "\n";
+				printedResultCount += wrapped_lines_2;
+				res->printingHeight += wrapped_lines_2;
 			}
 
 			if (completed && !startIncompleteSet) {
@@ -297,8 +365,8 @@ int main(int argc, char* argv[]) {
 		lastPrintedResultCount = printedResultCount;
 
 		while (idx_startUnprinted < results.size() && results[idx_startUnprinted]->printed) {
-			if (results[idx_startUnprinted]->occurences.size() > 0)
-				completed_last_iter++;
+			if (results[idx_startUnprinted]->occurences.size() > 0 && idx_startUnprinted)
+				completed_last_iter += results[idx_startUnprinted]->printingHeight;
 			idx_startUnprinted++;
 		}
 
@@ -339,13 +407,13 @@ int main(int argc, char* argv[]) {
 				// Only print if there were any occurrences found
 				if (!res->occurences.empty()) {
 					// Line 1: Filename and optional path
-					std::cout << res->pdf_path.filename();
+					std::cout << res->pdf_path.filename().string();
 					if (print_path)
-						std::cout << "\t" << res->pdf_path.parent_path();
+						std::cout << "    " << res->pdf_path.parent_path();
 					std::cout << "\n";
 
 					// Line 2: Tab followed by pages (ensuring sorted and unique)
-					std::cout << "\t";
+					std::cout << "    ";
 					std::vector<int> final_pages_for_output;
 					for(const auto& occ : res->occurences) {
 						final_pages_for_output.push_back(occ.page);
@@ -362,7 +430,7 @@ int main(int argc, char* argv[]) {
 					// If print_line is requested, show full line details (these are separate, not part of the 2-line result)
 					if (print_line) {
 						for (const auto& occ : res->occurences) {
-							std::cout << "\t\tPage " << occ.page << ", Line " << occ.line_number << ": " << occ.line << "\n";
+							std::cout << "        Page " << occ.page << ", Line " << occ.line_number << ": " << occ.line << "\n";
 						}
 					}
 				}
