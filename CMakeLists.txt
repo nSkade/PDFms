@@ -1,12 +1,18 @@
 cmake_minimum_required(VERSION 3.17)
 
-# Use vcpkg toolchain from environment variable
-set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-
-project(pdfms LANGUAGES CXX)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+SET(VCPKG_BOOTSTRAP_OPTIONS "-disableMetrics") # Disable telemetry for vcpkg.
+SET(X_VCPKG_APPLOCAL_DEPS_INSTALL ON)          # Install vcpkg dependencies automatically(experimental - might be changed or removed later; see: https://github.com/microsoft/vcpkg/issues/1653). 
+
+# use local vcpkg_installed folder at the root of the project
+set(VCPKG_INSTALLED_DIR "${CMAKE_SOURCE_DIR}/vcpkg_installed")
+message(VCPKG_TARGET_TRIPLET "${VCPKG_TARGET_TRIPLET}")
+list(APPEND CMAKE_PREFIX_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+
+project(pdfms LANGUAGES CXX)
 
 # Find Poppler (with pkg-config)
 find_package(PkgConfig REQUIRED)
