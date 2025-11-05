@@ -39,12 +39,25 @@ struct Occurence {
 	std::string line;
 };
 
-struct SearchResult {
+class SearchResult {
 	fs::path pdf_path;
 	std::vector<Occurence> occurences;
 	bool completed = false;
 	bool printed = false; // True when the final 2-line output for this result has been printed and finalized.
 	int printingHeight = 0;
+	std::mutex mtx;
+public:
+	const fs::path& getPdfPath() const { return pdf_path; }
+	std::vector<Occurence> getOccurences() { std::lock_guard<std::mutex> guard(mtx); return occurences; }
+	bool getCompleted() { std::lock_guard<std::mutex> guard(mtx); return completed; }
+	bool getPrinted() { std::lock_guard<std::mutex> guard(mtx); return printed; }
+	int getPrintingHeight() { std::lock_guard<std::mutex> guard(mtx); return printingHeight; }
+	
+	void setPdfPath(const fs::path& path) { std::lock_guard<std::mutex> guard(mtx); pdf_path = path; }
+	void addOccurrence(const Occurence& occ) { std::lock_guard<std::mutex> guard(mtx); occurences.push_back(occ); }
+	void setCompleted(bool status = true) { std::lock_guard<std::mutex> guard(mtx); completed = status; }
+	void setPrinted(bool status = true) { std::lock_guard<std::mutex> guard(mtx); printed = status; }
+	void setPrintingHeight(int height) { std::lock_guard<std::mutex> guard(mtx); printingHeight = height; }
 };
 
 // Get all PDF files in directory (optionally shuffled)
@@ -91,7 +104,7 @@ void delete_last_lines(int count) {
 #if 0 // clear line
 				  << "\033[2K\r";  // Clear entire line and return cursor to beginning
 #else // overwrite line, no flicker
-				  << "\r";  // Clear entire line and return cursor to beginning
+				  << "\r";	// Clear entire line and return cursor to beginning
 #endif
 	std::cout.flush();
 }
@@ -110,25 +123,28 @@ std::string tolower(const std::string& s) {
 #endif
 
 int getConsoleWidth() {
-    int columns = 80; // Default or fallback value
+	int columns = 80; // Default or fallback value
 
 #ifdef _WIN32
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
-        columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
-    }
+	CONSOLE_SCREEN_BUFFER_INFO csbi;
+	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+		columns = csbi.srWindow.Right - csbi.srWindow.Left + 1;
+	}
 #elif defined(__linux__) || defined(__APPLE__)
-    struct winsize w;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
-        columns = w.ws_col;
-    }
+	struct winsize w;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
+		columns = w.ws_col;
+	}
 #endif
-    return columns;
+	return columns;
 }
 
 int main(int argc, char* argv[]) {
 	suppress_poppler_stderr();
 	enable_ansi_escape_codes();
+
+	//TODO make SearchResult with error instead
+	std::vector<std::string> erroredPaths;
 
 	//auto screen = ftxui::ScreenInteractive::TerminalOutput();
 	//auto renderer = ftxui::Renderer([&] {
@@ -200,7 +216,14 @@ int main(int argc, char* argv[]) {
 			}
 
 			const auto& pdf_path = pdfs[idx];
-			std::string pdf_path_str = pdf_path.string();
+			std::string pdf_path_str;
+			try {
+				pdf_path_str = pdf_path.string();
+			} catch (...) {
+				completed_files++;
+				erroredPaths.push_back(pdf_path.u8string());
+				continue;
+			}
 
 			poppler::document* doc = nullptr;
 			try {
@@ -214,9 +237,10 @@ int main(int argc, char* argv[]) {
 				continue;
 			}
 			std::shared_ptr<SearchResult> current_res = std::make_shared<SearchResult>();
-			current_res->pdf_path = pdf_path;
+			//current_res->pdf_path = pdf_path;
+			current_res->setPdfPath(pdf_path);
 			{
-				std::unique_lock<std::mutex> lock(results_mutex);
+				std::lock_guard<std::mutex> lock(results_mutex);
 				results.push_back(current_res);
 			}
 
@@ -234,7 +258,8 @@ int main(int argc, char* argv[]) {
 					if (tolower(line).find(targetLower) != std::string::npos) {
 						Occurence occurrence{ i + 1, line_number, line };
 						// Add occurrence directly to shared SearchResult
-						current_res->occurences.push_back(occurrence);
+						current_res->addOccurrence(occurrence);;
+						//current_res->occurences.push_back(occurrence); //TODO(remove)
 						// Notify the main thread that there's an update.
 						// This notification is what allows the main thread to pick up incremental page findings.
 						queue_cv.notify_one();
@@ -244,7 +269,8 @@ int main(int argc, char* argv[]) {
 
 			// After processing all pages for this PDF
 			{
-				current_res->completed = true;
+				//current_res->completed = true; //TODO(remove)
+				current_res->setCompleted(true);
 				completed_files++;
 				queue_cv.notify_one(); // Notify main thread that this file is fully completed
 			}
@@ -265,9 +291,10 @@ int main(int argc, char* argv[]) {
 	size_t lastPrintedResultCount = 0; // How many *results* (each 2 lines) were displayed in the *previous* refresh.
 
 	auto allPrinted = [&]() -> bool {
+		std::lock_guard<std::mutex> lock(results_mutex);
 		for (int i=0;i<results.size();++i) {
-			auto r = results[i].get();
-			if (r && !r->printed)
+			auto r = results[i];
+			if (r && !r->getPrinted())
 				return false;
 		}
 		return true;
@@ -301,48 +328,55 @@ int main(int argc, char* argv[]) {
 
 		std::stringstream buf;
 		bool startIncompleteSet = false;
-		for (size_t i = idx_startUnprinted; i < results.size(); ++i) {
+
+		int count = 0;
+		{ //  dont lock for whole duration to avoid blocking search threads
+			std::lock_guard<std::mutex> lock(results_mutex);
+			count = results.size();
+		}
+		for (int i = idx_startUnprinted; i < count; ++i) {
 
 			std::shared_ptr<SearchResult> res;
 			bool completed;
 			{
 				std::unique_lock<std::mutex> lock(results_mutex);
 				res = results[i];
-				completed = res->completed;
 			}
+			completed = res->getCompleted();
 
-			if (completed && res->occurences.size()==0) {
-					res->printed = true;
+			auto occurences = res->getOccurences();
+			if (completed && occurences.size()==0) {
+					res->setPrinted(true);
 					continue;
 				}
-			else if (!completed && res->occurences.size()==0) {
+			else if (!completed && occurences.size()==0) {
 				continue;
 			}
 
 			std::vector<int> display_pages;
-			for (const auto& occ : res->occurences)
+			for (const auto& occ : occurences)
 				display_pages.push_back(occ.page);
 			std::sort(display_pages.begin(), display_pages.end());
 			display_pages.erase(std::unique(display_pages.begin(), display_pages.end()), display_pages.end());
 
 			{ // printing
-				res->printingHeight = 0;
+				res->setPrintingHeight(0);
 				int consoleWidth = getConsoleWidth();
 				
 				// --- Line 1: Filename and optional path ---
-				std::string line1_content = res->pdf_path.filename().string();
+				std::string line1_content = res->getPdfPath().filename().string();
 				if (print_path) {
-					line1_content += "    " + res->pdf_path.parent_path().string();
+					line1_content += "	" + res->getPdfPath().parent_path().string();
 				}
 				
 				int wrapped_lines_1 = (line1_content.length() + consoleWidth - 1) / consoleWidth;
 				
 				buf << line1_content << "\n";
 				printedResultCount += wrapped_lines_1;
-				res->printingHeight += wrapped_lines_1;
+				int resPh = wrapped_lines_1;
 				
 				// --- Line 2: Tab followed by pages ---
-				std::string line2_content = "    "; // Start with the tab
+				std::string line2_content = "	"; // Start with the tab
 				for (size_t j = 0; j < display_pages.size(); ++j) {
 					if (j > 0) line2_content += ", ";
 					line2_content += std::to_string(display_pages[j]);
@@ -352,11 +386,12 @@ int main(int argc, char* argv[]) {
 				
 				buf << line2_content << "\n";
 				printedResultCount += wrapped_lines_2;
-				res->printingHeight += wrapped_lines_2;
+				resPh += wrapped_lines_2;
+				res->setPrintingHeight(res->getPrintingHeight()+resPh);
 			}
 
 			if (completed && !startIncompleteSet) {
-				res->printed = true;
+				res->setPrinted(true);
 			}
 			else if (!startIncompleteSet) {
 				startIncompleteSet = true;
@@ -364,10 +399,13 @@ int main(int argc, char* argv[]) {
 		}
 		lastPrintedResultCount = printedResultCount;
 
-		while (idx_startUnprinted < results.size() && results[idx_startUnprinted]->printed) {
-			if (results[idx_startUnprinted]->occurences.size() > 0 && idx_startUnprinted)
-				completed_last_iter += results[idx_startUnprinted]->printingHeight;
-			idx_startUnprinted++;
+		{
+			std::unique_lock<std::mutex> lock(results_mutex);
+			while (idx_startUnprinted < results.size() && results[idx_startUnprinted]->getPrinted()) {
+				if (results[idx_startUnprinted]->getOccurences().size() > 0 && idx_startUnprinted)
+					completed_last_iter += results[idx_startUnprinted]->getPrintingHeight();
+				idx_startUnprinted++;
+			}
 		}
 
 		float progress = float(completed_files)*100./total_files;
@@ -386,6 +424,15 @@ int main(int argc, char* argv[]) {
 	if (abort_thread.joinable()) abort_thread.detach(); // Detach the input thread
 
 	const bool debug_check = true;
+
+	std::cout << "completed!\n";
+	if (erroredPaths.size())
+		std::cout << "\nerroredPaths:\n";
+	for (auto& s : erroredPaths)
+		std::cout << s << std::endl;
+
+	//TODO fix for new mutex
+#if 0
 	if (sort_result) {
 
 		//delete_last_lines(results.size() * 2); // Clear the remaining active lines
@@ -409,11 +456,11 @@ int main(int argc, char* argv[]) {
 					// Line 1: Filename and optional path
 					std::cout << res->pdf_path.filename().string();
 					if (print_path)
-						std::cout << "    " << res->pdf_path.parent_path();
+						std::cout << "	" << res->pdf_path.parent_path();
 					std::cout << "\n";
 
 					// Line 2: Tab followed by pages (ensuring sorted and unique)
-					std::cout << "    ";
+					std::cout << "	";
 					std::vector<int> final_pages_for_output;
 					for(const auto& occ : res->occurences) {
 						final_pages_for_output.push_back(occ.page);
@@ -430,13 +477,13 @@ int main(int argc, char* argv[]) {
 					// If print_line is requested, show full line details (these are separate, not part of the 2-line result)
 					if (print_line) {
 						for (const auto& occ : res->occurences) {
-							std::cout << "        Page " << occ.page << ", Line " << occ.line_number << ": " << occ.line << "\n";
+							std::cout << "		Page " << occ.page << ", Line " << occ.line_number << ": " << occ.line << "\n";
 						}
 					}
 				}
 			}
 		}
 	}
-
+#endif
 	return 0;
 }
