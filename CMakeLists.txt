@@ -1,37 +1,43 @@
 cmake_minimum_required(VERSION 3.17)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(VCPKG_TARGET_TRIPLET x64-mingw-dynamic CACHE STRING "" FORCE)
+set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${CMAKE_SOURCE_DIR}/vcpkg-clang-mingw.cmake" CACHE STRING "" FORCE)
+set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "" FORCE)
 
-set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
-SET(VCPKG_BOOTSTRAP_OPTIONS "-disableMetrics") # Disable telemetry for vcpkg.
-SET(X_VCPKG_APPLOCAL_DEPS_INSTALL ON)          # Install vcpkg dependencies automatically(experimental - might be changed or removed later; see: https://github.com/microsoft/vcpkg/issues/1653). 
-
-# use local vcpkg_installed folder at the root of the project
 set(VCPKG_INSTALLED_DIR "${CMAKE_SOURCE_DIR}/vcpkg_installed")
-message(VCPKG_TARGET_TRIPLET "${VCPKG_TARGET_TRIPLET}")
-list(APPEND CMAKE_PREFIX_PATH "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+set(ENV{PKG_CONFIG_PATH} "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib/pkgconfig")
 
 project(pdfms LANGUAGES CXX)
 
-# Find Poppler (with pkg-config)
+set(CMAKE_CXX_STANDARD 17)
+set(VCPKG_BOOTSTRAP_OPTIONS "-disableMetrics")
+set(X_VCPKG_APPLOCAL_DEPS_INSTALL ON)
+
+add_compile_options("-stdlib=libc++")
+add_link_options("-stdlib=libc++")
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(POPPLER_CPP REQUIRED IMPORTED_TARGET poppler-cpp)
+
+add_executable(pdfms main.cpp)
+
+target_link_libraries(pdfms PRIVATE 
+    PkgConfig::POPPLER_CPP
+)
+
+target_precompile_headers(pdfms PRIVATE
+	pch.h
+)
 
 # Find FTXUI installed via vcpkg
 #find_package(ftxui CONFIG REQUIRED)
 
-# Add executable
-add_executable(pdfms main.cpp)
-
 # Link libraries
-target_link_libraries(pdfms PRIVATE
-  PkgConfig::POPPLER_CPP
+#target_link_libraries(pdfms PRIVATE
 #  ftxui::dom
 #  ftxui::screen
 #  ftxui::component
-)
-
+#)
 # this is required for ftxui to work on vscode clang with windows >:(
 ## Add additional compile options you want
 #target_compile_options(pdfms PRIVATE -Wno-deprecated-declarations)
