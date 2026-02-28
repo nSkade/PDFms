@@ -1,6 +1,6 @@
 #include "src/util.hpp"
-#include "src/SearchThread.hpp"
-#include "src/OutThreads.hpp"
+#include "src/SearchThreads.hpp"
+#include "src/OutThread.hpp"
 
 int main(int argc, char* argv[]) {
 	pdf::suppress_poppler_stderr();
